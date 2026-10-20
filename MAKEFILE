@@ -1,0 +1,178 @@
+#    Copyright (C) 2026  Mustafa Ali
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# makefile -- APFS VxD IFS Driver build rules
+#
+# Builds apfs.vxd using the Windows 98 DDK build utility.
+# Run from the DDK build environment (98DDK command prompt).
+#
+# Usage:
+#   build            (from DDK command prompt)
+#
+
+BUILD_TYPE=base
+!INCLUDE $(BASEDIR)\inc\master.mk
+
+# === Debug/Retail toggle ===
+
+!ifdef DEBUG
+DDEBUG  =-DDEBLEVEL=1 -DDEBUG
+!else
+DDEBUG  =-DDEBLEVEL=0
+!endif
+
+# === Target ===
+
+TARGET = APFS
+
+# === Output directory ===
+
+OUTDIR = obj\i386
+
+# === Compiler flags (C) ===
+#
+# -Zp1   pack structs on 1-byte boundary
+# -Gs    disable stack probes
+# -c     compile only
+# -DIS_32  32-bit VxD
+# -Zl    omit default library name
+# -Oi    enable intrinsics
+# -W3    warning level 3
+# -DWANTVXDWRAPS  enable C wrappers in vxdwraps.h
+# -FR    generate .sbr browse info files
+#
+# Include paths:
+#   $(INC32)                     = $(BASEDIR)\inc\win98  (set by master.mk)
+#   $(BASEDIR)\src\block\inc     = blockdev.h, PDCB, SGD, etc.
+
+CVXDFLAGS = -nologo -W3 -Zp1 -Gs -c -DIS_32 -Zl -Oi \
+		-Zi -FR$(OUTDIR)\ \
+            -D_X86_ -DWIN40 -DWANTVXDWRAPS $(DDEBUG) \
+            -I$(INC32) -I$(BASEDIR)\src\block\inc
+
+# === Assembler flags (MASM) ===
+
+AFLAGS = -nologo -coff -DBLD_COFF -DIS_32 -W3 -Zd -c -Cx -DMASM6 \
+         $(DDEBUG) -I$(INC32)
+
+# === Object files ===
+
+OBJS = $(OUTDIR)\devdcl.obj \
+       $(OUTDIR)\apfs_main.obj \
+	 $(OUTDIR)\apfs_resolve.obj \
+       $(OUTDIR)\apfs_dispatch.obj \
+       $(OUTDIR)\apfs_handle.obj \
+       $(OUTDIR)\apfs_blockio.obj \
+       $(OUTDIR)\apfs_checksum.obj \
+       $(OUTDIR)\apfs_gpt.obj \
+       $(OUTDIR)\apfs_container.obj \
+       $(OUTDIR)\apfs_omap.obj \
+       $(OUTDIR)\apfs_btree.obj \
+       $(OUTDIR)\apfs_volume.obj \
+       $(OUTDIR)\apfs_fsrec.obj \
+       $(OUTDIR)\apfs_names.obj \
+       $(OUTDIR)\apfs_time.obj \
+	 $(OUTDIR)\apfs_utils.obj
+
+# === Targets ===
+
+all: $(OUTDIR)\$(TARGET).vxd $(OUTDIR)\$(TARGET).bsc
+
+# === Compile rules ===
+
+$(OUTDIR)\devdcl.obj: devdcl.asm
+	ml $(AFLAGS) -Fo$@ $?
+
+$(OUTDIR)\apfs_main.obj: apfs_main.c apfs_vxd.h apfs_types.h gpt_types.h vxdwrap.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_main.c
+
+$(OUTDIR)\apfs_resolve.obj: apfs_resolve.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_resolve.c
+
+$(OUTDIR)\apfs_dispatch.obj: apfs_dispatch.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_dispatch.c
+
+$(OUTDIR)\apfs_handle.obj: apfs_handle.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_handle.c
+
+$(OUTDIR)\apfs_blockio.obj: apfs_blockio.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_blockio.c
+
+$(OUTDIR)\apfs_checksum.obj: apfs_checksum.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_checksum.c
+
+$(OUTDIR)\apfs_gpt.obj: apfs_gpt.c apfs_vxd.h gpt_types.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_gpt.c
+
+$(OUTDIR)\apfs_container.obj: apfs_container.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_container.c
+
+$(OUTDIR)\apfs_omap.obj: apfs_omap.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_omap.c
+
+$(OUTDIR)\apfs_btree.obj: apfs_btree.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_btree.c
+
+$(OUTDIR)\apfs_volume.obj: apfs_volume.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_volume.c
+
+$(OUTDIR)\apfs_fsrec.obj: apfs_fsrec.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_fsrec.c
+
+$(OUTDIR)\apfs_names.obj: apfs_names.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_names.c
+
+$(OUTDIR)\apfs_time.obj: apfs_time.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_time.c
+
+$(OUTDIR)\apfs_utils.obj: apfs_utils.c apfs_vxd.h
+	cl $(CVXDFLAGS) -Fo$@ apfs_utils.c
+
+# === Link ===
+#
+# Uses a response file like the UMSS PDR sample.
+# vxdwraps.clb is in $(BASEDIR)\lib\i386\free\.
+# -ignore:4078  suppress fixup warnings for VxD segments
+# -ignore:4039  suppress default lib warnings
+# -ignore:4070  suppress .drectve warnings
+
+$(OUTDIR)\$(TARGET).vxd: $(OBJS) apfs.def
+	echo >NUL @<<$(TARGET).crf
+-MACHINE:i386 -DEBUG -DEBUGTYPE:CV -PDB:NONE
+-DEF:apfs.def -OUT:$(OUTDIR)\$(TARGET).vxd -MAP:$(OUTDIR)\$(TARGET).map
+-VXD -ignore:4078 -ignore:4039 -ignore:4070
+$(BASEDIR)\lib\i386\free\vxdwraps.clb
+$(OBJS)
+<<
+!ifndef PASS0ONLY
+	@echo link -OUT:$@
+	link @$(TARGET).crf
+!endif
+
+$(OUTDIR)\$(TARGET).bsc :
+	bscmake /n /o $(OUTDIR)\$(TARGET).bsc $(OUTDIR)\*.sbr
+
+# === Clean ===
+
+clean:
+	-@if exist $(OUTDIR)\*.obj del $(OUTDIR)\*.obj
+	-@if exist $(OUTDIR)\*.vxd del $(OUTDIR)\*.vxd
+	-@if exist $(OUTDIR)\*.exp del $(OUTDIR)\*.exp
+	-@if exist $(OUTDIR)\*.map del $(OUTDIR)\*.map
+	-@if exist $(OUTDIR)\*.sym del $(OUTDIR)\*.sym
+	-@if exist $(OUTDIR)\*.lib del $(OUTDIR)\*.lib
+	-@if exist *.crf del *.crf
+	-@if exist *.pdb del *.pdb
