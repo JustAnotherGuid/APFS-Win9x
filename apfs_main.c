@@ -200,7 +200,6 @@ static int our_volume_read_sector(apfs_volume_t* vol, DWORD sector_num,
 
     vrp = vol->vrp;
     dcb = (PDCB) vrp->VRP_device_handle;
-
     iop_size = vrp->VRP_max_req_size + vrp->VRP_max_sgd * sizeof(SGD);
     delta = vrp->VRP_delta_to_ior;
 
@@ -377,7 +376,6 @@ static int apfs_our_volume(apfs_volume_t* vol) {
         }
 
         entry = (gpt_partition_entry_t*)(entry_buf + offset_in_sector);
-
         if (memcmp(entry->partition_type_guid, APFS_GPT_GUID, 16) == 0) {
             partition_start = entry->starting_lba * SECTOR_SIZE;
             Debug_Printf("APFS: OurVolume: APFS partition found at LBA %lu\r\n",

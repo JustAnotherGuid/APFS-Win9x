@@ -383,6 +383,15 @@ uint8_t* cache_find(block_cache_t* cache, uint64_t block_addr);
 void cache_invalidate_all(block_cache_t* cache);
 
 /*
+ * apfs_read_block_without_cache -- Read a single APFS block via IOS, without caching.
+ * vol:        Pointer to mounted volume context
+ * block_addr: APFS block address to read
+ * buf:        Output buffer (must be at least vol->block_size bytes)
+ * Returns:    0 on success, Win32 error code on failure
+ */
+int apfs_read_block_without_cache(apfs_volume_t* vol, uint64_t block_addr, void* buf);
+
+/*
  * apfs_read_block -- Read a single APFS block via IOS, with caching.
  * vol:        Pointer to mounted volume context
  * block_addr: APFS block address to read
@@ -668,7 +677,6 @@ int _cdecl apfs_dir(pioreq pir);
 int _cdecl apfs_file_attributes(pioreq pir);
 int _cdecl apfs_flush_volume(pioreq pir);
 int _cdecl apfs_get_disk_info(pioreq pir);
-int _cdecl apfs_open_file(pioreq pir);
 int _cdecl apfs_rename_file(pioreq pir);
 int _cdecl apfs_search_file(pioreq pir);
 int _cdecl apfs_query_resource_info(pioreq pir);
@@ -686,6 +694,7 @@ int _cdecl apfs_read_file(pioreq pir);
 int _cdecl apfs_write_file(pioreq pir);
 int _cdecl apfs_file_seek(pioreq pir);
 int _cdecl apfs_close_file(pioreq pir);
+int _cdecl apfs_open_file(pioreq pir);
 int _cdecl apfs_file_datetime(pioreq pir);
 int _cdecl apfs_find_next_file(pioreq pir);
 int _cdecl apfs_find_close(pioreq pir);

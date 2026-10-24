@@ -26,6 +26,29 @@
 #include "apfs_vxd.h"
 
 /*
+ * apfs_open_misc -- Handle-level misc functions for open file handles.
+ *
+ * Seek and close are implemented in apfs_handle.c.
+ * Commit, filelocks, piperequest, handleinfo are no-ops (read-only).
+ * Filetimes and enumhandle are implemented in apfs_handle.c.
+ */
+hndlmisc apfs_open_misc = {
+	IFS_VERSION,                            /* hm_version */
+	IFS_REVISION,                           /* hm_revision */
+	NUM_HNDLMISC,                           /* hm_size */
+	{
+		(pIFSFunc) apfs_file_seek,              /* HM_SEEK         = 0 */
+		(pIFSFunc) apfs_close_file,             /* HM_CLOSE        = 1 */
+		(pIFSFunc) apfs_empty_func,             /* HM_COMMIT       = 2 */
+		(pIFSFunc) apfs_empty_func,             /* HM_FILELOCKS    = 3 */
+		(pIFSFunc) apfs_file_datetime,          /* HM_FILETIMES    = 4 */
+		(pIFSFunc) apfs_empty_func,             /* HM_PIPEREQUEST  = 5 */
+		(pIFSFunc) apfs_empty_func,             /* HM_HANDLEINFO   = 6 */
+		(pIFSFunc) apfs_enumerate_handle        /* HM_ENUMHANDLE   = 7 */
+	}
+};
+
+/*
  * read_ctx_t -- Visitor context for extent-based file reading.
  *
  * Passed to the extent visitor callback. Tracks the current read
@@ -119,7 +142,7 @@ static int read_extent_visitor(const void* key, uint16_t key_len,
 			chunk = ext_bytes;
 		}
 
-		rc = apfs_read_block(ctx->vol, start_block, block_buf);
+		rc = apfs_read_block_without_cache(ctx->vol, start_block, block_buf);
 		if (rc != 0) {
 			Debug_Printf("APFS: ReadFile: block read failed "
 			             "at block 0x%08lX%08lX\r\n",
@@ -163,8 +186,6 @@ int _cdecl apfs_read_file(pioreq pir) {
 	uint32_t nbytes;
 	read_ctx_t ctx;
 	int rc;
-
-	Debug_Printf("APFS: entering apfs_read_file\r\n");
 
 	fp = (apfs_file_t*) pir->ir_fh;
 	if (fp == NULL) {
@@ -214,6 +235,94 @@ int _cdecl apfs_read_file(pioreq pir) {
 	fp->pos = pos + (uint64_t)ctx.bytes_read;
 	pir->ir_pos = (ULONG) fp->pos;
 	pir->ir_length = ctx.bytes_read;
+
+	return 0;
+}
+
+/*
+ * apfs_open_file -- Opens a file for reading. Rejects write access, resolves the path,  
+ * looks up the inode, extracts the data stream, allocates an apfs_file_t
+ * handle, and sets up the IFS response	
+ */
+int _cdecl apfs_open_file(pioreq pir) {
+	apfs_volume_t* vol;
+	int mode;
+	uint64_t ino;
+	uint8_t dtype;
+	int rc;
+	j_inode_val_t inode;
+	uint64_t file_size;
+	apfs_file_t* fp;
+	BYTE attr;
+
+	char path[MAX_NAME_CHARS];
+	UniToBCSPath(path, pir->ir_ppath->pp_elements, MAX_NAME_CHARS, BCS_WANSI);
+	Debug_Printf("APFS: OpenFile: Path=%s\r\n", path);
+	Debug_Printf("APFS: OpenFile: Entering apfs_open_file\r\n");
+
+	vol = (apfs_volume_t*) pir->ir_rh;
+
+	mode = pir->ir_flags & ACCESS_MODE_MASK;
+	if (mode == ACCESS_WRITEONLY || mode == ACCESS_READWRITE) {
+		pir->ir_error = ERROR_WRITE_PROTECT;
+		return pir->ir_error;
+	}
+
+	rc = apfs_resolve_path(vol, pir->ir_ppath, &ino, &dtype);
+	if (rc != 0) {
+		Debug_Printf("APFS: OpenFile: Failed to resolve path\n");
+		pir->ir_error = rc;
+		return rc;
+	}
+
+	/* Look up inode and its logical size (dstream-aware).
+	 * apfs_inode_info() extracts the DSTREAM xfield rather than trusting
+	 * the fixed inode's uncompressed_size, which is 0 for normal APFS
+	 * files 
+	 */
+	file_size = 0;
+	rc = apfs_inode_info(vol, ino, &inode, &file_size);
+	if (rc != 0) {
+		Debug_Printf("APFS: OpenFile: Failed to get inode info\n");
+		pir->ir_error = ERROR_FILE_NOT_FOUND;
+		return ERROR_FILE_NOT_FOUND;
+	}
+
+	Debug_Printf("APFS: OpenFile: dtype=%u mode=0x%04X size=%lu\r\n",
+	             (DWORD)dtype, (DWORD)inode.mode, (DWORD)file_size);
+
+	fp = (apfs_file_t*) _HeapAllocate(sizeof(apfs_file_t), HEAPZEROINIT);
+	if (fp == NULL) {
+		pir->ir_error = ERROR_NOT_ENOUGH_MEMORY;
+		return pir->ir_error;
+	}
+
+	fp->vol = vol;
+	fp->ino = ino;
+	fp->private_id = inode.private_id;
+	fp->size = file_size;
+	fp->pos = 0;
+	memcpy(&fp->inode, &inode, sizeof(j_inode_val_t));
+	fp->d_type = dtype;
+	fp->mode = inode.mode;
+
+	pir->ir_fh = (fh_t) fp;
+
+	/* ir_size is a MSVC "long" which is a 32-bit value.... */
+	if (fp->size > 0xFFFFFFFF) {
+		pir->ir_size = 0xFFFFFFFF;
+	} else {
+		pir->ir_size = (ULONG) fp->size;
+	}
+
+	pir->ir_dostime = apfs_to_dos_time(inode.mod_time);
+	attr = apfs_synthesize_dos_attr(dtype, inode.mode, NULL, 0);
+	pir->ir_attr = attr;
+
+	SetHandleFunc(pir, (pIFSFunc) apfs_read_file, (pIFSFunc) apfs_write_file, &apfs_open_misc);
+	Debug_Printf("APFS: OpenFile: ino=0x%08lX%08lX size=%lu\r\n",
+	             (DWORD)(ino >> 32), (DWORD)(ino & 0xFFFFFFFF),
+	             pir->ir_size);
 
 	return 0;
 }

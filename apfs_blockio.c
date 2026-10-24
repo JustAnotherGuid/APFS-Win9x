@@ -30,16 +30,171 @@
 #include "apfs_vxd.h"
 
 /* ========================================================================== */
-/* Forward declarations                                                       */
-/* ========================================================================== */
-
-static void __cdecl apfs_on_block_read_complete(PIOR ior);
-
-/* ========================================================================== */
 /* Constants                                                                  */
 /* ========================================================================== */
 
 #define SECTOR_SIZE 512
+
+/* ========================================================================== */
+/* Internal helpers                                                           */
+/* ========================================================================== */
+
+/*
+ * apfs_on_block_read_complete -- IOR completion callback.
+ *
+ * Uses __cdecl calling convention as required for IOS callbacks.
+ *
+ * ior: pointer to the completed I/O Request
+ */
+static void __cdecl apfs_on_block_read_complete(PIOR ior) {
+	ior->IOR_completion_flag = 1;
+	IFSMgr_Wakeup((DWORD) &ior->IOR_completion_flag);
+}
+
+/*
+ * cache_get_evict_buffer -- Get a cache entry buffer for a new block read.
+ *
+ * Finds the LRU entry (lowest age) or an empty slot and returns a
+ * pointer to its data buffer. The caller reads disk data directly into
+ * this buffer, then calls cache_commit_entry() to finalize the entry.
+ *
+ * This supports the cache-mediated read flow:
+ * IOR_buffer_ptr points to heap-allocated cache memory (already locked
+ * by VMM), so no _LinPageLock is needed.
+ *
+ * cache:      pointer to block_cache_t
+ * out_index:  receives the index of the selected cache entry
+ * Returns:    pointer to the entry's data buffer, or NULL if cache is NULL
+ */
+static uint8_t* cache_get_evict_buffer(block_cache_t* cache, uint32_t* out_index) {
+	uint32_t i;
+	uint32_t lru_idx;
+	uint32_t lru_age;
+
+	if (cache == NULL) return NULL;
+
+	/* Find the LRU entry (lowest age) or first empty slot */
+	lru_idx = 0;
+	lru_age = cache->entries[0].age;
+
+	for (i = 1; i < BLOCK_CACHE_SIZE; i++) {
+		/* Prefer empty entries */
+		if (cache->entries[i].block_addr == ((uint64_t)0xFFFFFFFF << 32 | (uint64_t)0xFFFFFFFF)) {
+			lru_idx = i;
+			break;
+		}
+		if (cache->entries[i].age < lru_age) {
+			lru_age = cache->entries[i].age;
+			lru_idx = i;
+		}
+	}
+
+	*out_index = lru_idx;
+	return cache->entries[lru_idx].data;
+}
+
+/*
+ * cache_commit_entry -- Finalize a cache entry after a successful read.
+ *
+ * Sets the block_addr and updates the LRU age for the entry that was
+ * previously selected by cache_get_evict_buffer().
+ *
+ * cache:      pointer to block_cache_t
+ * index:      cache entry index (from cache_get_evict_buffer)
+ * block_addr: APFS block address that was read into this entry
+ */
+static void cache_commit_entry(block_cache_t* cache, uint32_t index, uint64_t block_addr) {
+	if (cache == NULL) return;
+
+	cache->entries[index].block_addr = block_addr;
+	cache->lru_counter++;
+	cache->entries[index].age = cache->lru_counter;
+}
+
+static int send_ior_command(apfs_volume_t* vol, uint64_t block_addr,uint8_t* read_buf, CMDCPLT ior_callback) {
+	PVRP vrp;
+	PDCB dcb;
+	PIOR ior;
+	USHORT iop_size;
+	ULONG delta;
+	DWORD sector;
+	DWORD count;
+	DWORD criteria;
+	DWORD status;
+	DWORD error;
+	
+	vrp = vol->vrp;
+	dcb = (PDCB) vrp->VRP_device_handle;
+	sector = (DWORD)(vol->partition_offset / SECTOR_SIZE) + (DWORD)(block_addr * (vol->block_size / SECTOR_SIZE));
+	count  = vol->block_size / SECTOR_SIZE;
+	iop_size = vrp->VRP_max_req_size + vrp->VRP_max_sgd * sizeof(SGD);
+	delta    = vrp->VRP_delta_to_ior;
+
+	ior = IspCreateIor(iop_size, delta, 0);
+	if (ior == NULL) {
+		Debug_Printf("APFS: send_ior_command: cannot allocate IOR\r\n");
+		return ERROR_NOT_ENOUGH_MEMORY;
+	}
+
+	ior->IOR_next            = 0;
+	ior->IOR_func            = IOR_READ;
+	ior->IOR_flags           = IORF_VERSION_002 | IORF_BYPASS_VOLTRK
+	                           | IORF_HIGH_PRIORITY;
+	ior->IOR_start_addr[0]   = sector;
+	ior->IOR_start_addr[1]   = 0;
+	ior->IOR_xfer_count      = count;
+	ior->IOR_buffer_ptr      = (ULONG) read_buf;
+	ior->IOR_num_sgds        = 0;
+	ior->IOR_vol_designtr    = vol->drive;
+	ior->IOR_req_vol_handle  = (ULONG) vrp;
+	ior->IOR_private_client  = delta;
+	ior->IOR_sgd_lin_phys    = (ULONG)(ior + 1);
+
+	criteria = IlbIoCriteria(ior);
+	if (criteria != 0) {
+		ior->IOR_flags |= IORF_DOUBLE_BUFFER;
+	}
+
+
+	if (vrp->VRP_demand_flags & VRP_dmd_removable_supp) {
+		ior->IOR_flags &= ~IORF_LOGICAL_START_SECTOR;
+		ior->IOR_start_addr[0] += vrp->VRP_partition_offset;
+	} else {
+		ior->IOR_flags |= IORF_LOGICAL_START_SECTOR;
+	}
+
+	ior->IOR_completion_flag = 0;
+	ior->IOR_callback        = ior_callback;
+	ior->IOR_req_req_handle  = (ULONG) ior;
+
+		/* IOS may clobber EDI -- save/restore */
+	_asm push edi
+	IOS_SendCommand(ior, dcb);
+	_asm pop edi
+
+	/*
+	 * Although the DDK sample and LPFS from Systems Programming for Windows 95
+	 * wrap these calls around cli/sti blocks to prevent interrupts we do not
+	 * do that here because IFSMgr_Block wraps around the VMM's __BlockOnId 
+	 * function with interrupts enabled so cli would kind of defeat the purpose.
+	 */
+	while (!ior->IOR_completion_flag) {
+		IFSMgr_Block((DWORD) &ior->IOR_completion_flag);
+	}
+
+
+	status = ior->IOR_status;
+	if (status >= IORS_ERROR_DESIGNTR) {
+		error = IOSMapIORSToI21(status);
+		Debug_Printf("APFS: send_ior_command: IOR failed, status=0x%04lX err=%lu "
+		             "block=%lu\r\n", status, error, (DWORD) block_addr);
+	} else {
+		error = 0;
+	}
+
+	IspDeallocMem((PVOID)((DWORD)ior - ior->IOR_private_client));
+	return (int)error;	
+}
 
 /*
  * cache_init -- Allocate and initialize a block cache for a volume.
@@ -154,71 +309,9 @@ void cache_invalidate_all(block_cache_t* cache) {
 	Debug_Printf("APFS: cache_invalidate_all: all entries cleared\r\n");
 }
 
-
-/* ========================================================================== */
-/* Internal helpers                                                           */
-/* ========================================================================== */
-
-/*
- * cache_get_evict_buffer -- Get a cache entry buffer for a new block read.
- *
- * Finds the LRU entry (lowest age) or an empty slot and returns a
- * pointer to its data buffer. The caller reads disk data directly into
- * this buffer, then calls cache_commit_entry() to finalize the entry.
- *
- * This supports the cache-mediated read flow:
- * IOR_buffer_ptr points to heap-allocated cache memory (already locked
- * by VMM), so no _LinPageLock is needed.
- *
- * cache:      pointer to block_cache_t
- * out_index:  receives the index of the selected cache entry
- * Returns:    pointer to the entry's data buffer, or NULL if cache is NULL
- */
-static uint8_t* cache_get_evict_buffer(block_cache_t* cache, uint32_t* out_index) {
-	uint32_t i;
-	uint32_t lru_idx;
-	uint32_t lru_age;
-
-	if (cache == NULL) return NULL;
-
-	/* Find the LRU entry (lowest age) or first empty slot */
-	lru_idx = 0;
-	lru_age = cache->entries[0].age;
-
-	for (i = 1; i < BLOCK_CACHE_SIZE; i++) {
-		/* Prefer empty entries */
-		if (cache->entries[i].block_addr == ((uint64_t)0xFFFFFFFF << 32 | (uint64_t)0xFFFFFFFF)) {
-			lru_idx = i;
-			break;
-		}
-		if (cache->entries[i].age < lru_age) {
-			lru_age = cache->entries[i].age;
-			lru_idx = i;
-		}
-	}
-
-	*out_index = lru_idx;
-	return cache->entries[lru_idx].data;
+int apfs_read_block_without_cache(apfs_volume_t* vol, uint64_t block_addr, void* buf) { 
+	return send_ior_command(vol, block_addr, (uint8_t*)buf, (CMDCPLT)apfs_on_block_read_complete);
 }
-
-/*
- * cache_commit_entry -- Finalize a cache entry after a successful read.
- *
- * Sets the block_addr and updates the LRU age for the entry that was
- * previously selected by cache_get_evict_buffer().
- *
- * cache:      pointer to block_cache_t
- * index:      cache entry index (from cache_get_evict_buffer)
- * block_addr: APFS block address that was read into this entry
- */
-static void cache_commit_entry(block_cache_t* cache, uint32_t index, uint64_t block_addr) {
-	if (cache == NULL) return;
-
-	cache->entries[index].block_addr = block_addr;
-	cache->lru_counter++;
-	cache->entries[index].age = cache->lru_counter;
-}
-
 
 
 /*
@@ -245,32 +338,18 @@ static void cache_commit_entry(block_cache_t* cache, uint32_t index, uint64_t bl
  * Returns:    0 on success, Win32 error code on failure
  */
 int apfs_read_block(apfs_volume_t* vol, uint64_t block_addr, void* buf) {
-	PVRP vrp;
-	PDCB dcb;
-	PIOR ior;
-	USHORT iop_size;
-	ULONG delta;
-	DWORD sector;
-	DWORD count;
-	DWORD criteria;
-	DWORD status;
-	DWORD error;
+	int error;
 	uint8_t* cached;
 	uint8_t* read_buf;
 	uint32_t cache_idx;
 
 	if (vol == NULL || buf == NULL) return ERROR_INVALID_PARAMETER;
+	
 	cached = cache_find(vol->cache, block_addr);
 	if (cached != NULL) {
 		memcpy(buf, cached, vol->block_size);
 		return 0;
 	}
-
-
-	vrp = vol->vrp;
-	dcb = (PDCB) vrp->VRP_device_handle;
-	sector = (DWORD)(vol->partition_offset / SECTOR_SIZE) + (DWORD)(block_addr * (vol->block_size / SECTOR_SIZE));
-	count  = vol->block_size / SECTOR_SIZE;
 
 	read_buf = cache_get_evict_buffer(vol->cache, &cache_idx);
 	if (read_buf == NULL) {
@@ -278,82 +357,14 @@ int apfs_read_block(apfs_volume_t* vol, uint64_t block_addr, void* buf) {
 		cache_idx = 0xFFFFFFFF;  /* No cache commit */
 	}
 
-
-	iop_size = vrp->VRP_max_req_size + vrp->VRP_max_sgd * sizeof(SGD);
-	delta    = vrp->VRP_delta_to_ior;
-
-	ior = IspCreateIor(iop_size, delta, 0);
-	if (ior == NULL) {
-		Debug_Printf("APFS: read_block: cannot allocate IOR\r\n");
-		return ERROR_NOT_ENOUGH_MEMORY;
-	}
-
-	ior->IOR_next            = 0;
-	ior->IOR_func            = IOR_READ;
-	ior->IOR_flags           = IORF_VERSION_002 | IORF_BYPASS_VOLTRK
-	                           | IORF_HIGH_PRIORITY;
-	ior->IOR_start_addr[0]   = sector;
-	ior->IOR_start_addr[1]   = 0;
-	ior->IOR_xfer_count      = count;
-	ior->IOR_buffer_ptr      = (ULONG) read_buf;
-	ior->IOR_num_sgds        = 0;
-	ior->IOR_vol_designtr    = vol->drive;
-	ior->IOR_req_vol_handle  = (ULONG) vrp;
-	ior->IOR_private_client  = delta;
-	ior->IOR_sgd_lin_phys    = (ULONG)(ior + 1);
-
-	criteria = IlbIoCriteria(ior);
-	if (criteria != 0) {
-		ior->IOR_flags |= IORF_DOUBLE_BUFFER;
-	}
-
-
-	if (vrp->VRP_demand_flags & VRP_dmd_removable_supp) {
-		ior->IOR_flags &= ~IORF_LOGICAL_START_SECTOR;
-		ior->IOR_start_addr[0] += vrp->VRP_partition_offset;
-	} else {
-		ior->IOR_flags |= IORF_LOGICAL_START_SECTOR;
-	}
-
-	ior->IOR_completion_flag = 0;
-	ior->IOR_callback        = (CMDCPLT) apfs_on_block_read_complete;
-	ior->IOR_req_req_handle  = (ULONG) ior;
-
-
-	/* IOS may clobber EDI -- save/restore */
-	_asm push edi
-	IOS_SendCommand(ior, dcb);
-	_asm pop edi
-
-	/*
-	 * Although the DDK sample and LPFS from Systems Programming for Windows 95
-	 * wrap these calls around cli/sti blocks to prevent interrupts we do not
-	 * do that here because IFSMgr_Block wraps around the VMM's __BlockOnId 
-	 * function with interrupts enabled so cli would kind of defeat the purpose.
-	 */
-	while (!ior->IOR_completion_flag) {
-		IFSMgr_Block((DWORD) &ior->IOR_completion_flag);
-	}
-
-
-	status = ior->IOR_status;
-	if (status >= IORS_ERROR_DESIGNTR) {
-		error = IOSMapIORSToI21(status);
-		Debug_Printf("APFS: read_block: IOR failed, status=0x%04lX err=%lu "
-		             "block=%lu\r\n", status, error, (DWORD) block_addr);
-	} else {
-		error = 0;
-	}
-
-
-	IspDeallocMem((PVOID)((DWORD)ior - ior->IOR_private_client));
+	error = send_ior_command(vol, block_addr, read_buf, (CMDCPLT)apfs_on_block_read_complete);
 	if (error == 0) {
 		if (cache_idx != 0xFFFFFFFF) {
 			cache_commit_entry(vol->cache, cache_idx, block_addr);
 			memcpy(buf, read_buf, vol->block_size);
 		}
 	}
-	return (int) error;
+	return (int)error;
 }
 
 
@@ -385,17 +396,4 @@ int apfs_read_blocks(apfs_volume_t* vol, uint64_t block_addr, uint32_t count, vo
 	}
 
 	return 0;
-}
-
-
-/*
- * apfs_on_block_read_complete -- IOR completion callback.
- *
- * Uses __cdecl calling convention as required for IOS callbacks.
- *
- * ior: pointer to the completed I/O Request
- */
-static void __cdecl apfs_on_block_read_complete(PIOR ior) {
-	ior->IOR_completion_flag = 1;
-	IFSMgr_Wakeup((DWORD) &ior->IOR_completion_flag);
 }
