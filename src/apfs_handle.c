@@ -32,7 +32,7 @@
  * Commit, filelocks, piperequest, handleinfo are no-ops (read-only).
  * Filetimes and enumhandle are implemented in apfs_handle.c.
  */
-hndlmisc apfs_open_misc = {
+static hndlmisc apfs_open_misc = {
 	IFS_VERSION,                            /* hm_version */
 	IFS_REVISION,                           /* hm_revision */
 	NUM_HNDLMISC,                           /* hm_size */

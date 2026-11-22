@@ -31,7 +31,7 @@
  * Only close is meaningful (frees the find context).
  * All other operations are no-ops.
  */
-hndlmisc apfs_find_misc = {
+static hndlmisc apfs_find_misc = {
 	IFS_VERSION,                            /* hm_version */
 	IFS_REVISION,                           /* hm_revision */
 	NUM_HNDLMISC,                           /* hm_size */

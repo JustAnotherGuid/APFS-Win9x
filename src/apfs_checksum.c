@@ -23,17 +23,14 @@
  *
  * The APFS Fletcher-64 checksum works as follows:
  * - The block is treated as an array of 32-bit unsigned integers.
- * - Two 64-bit accumulators (sum1, sum2) are maintained.
+ * - Two 32-bit values (sum1, sum2) that are added and modulo-ed with 0xFFFFFFFF.
  * - For each 32-bit word: sum1 += word, sum2 += sum1.
- * - After processing all words, the sums are folded:
- *     sum1 = sum1 % 0xFFFFFFFF
- *     sum2 = sum2 % 0xFFFFFFFF
- * - The checksum is computed so that when stored in the first 8 bytes
- *   of the object, the overall Fletcher-64 over the entire block is zero.
- *   Specifically: cksum_lo = 0xFFFFFFFF - ((sum1 + sum2) % 0xFFFFFFFF)
- *                 cksum_hi = 0xFFFFFFFF - ((sum1 + cksum_lo) % 0xFFFFFFFF)
- *                 result   = (cksum_hi << 32) | cksum_lo
- *
+ * - After processing all words, the sums are combined:
+ *     cksum_lo = MOD_VALUE - addmod(sum1, sum2)
+ *     cksum_hi = MOD_VALUE - addmod(sum1, cksum_lo)
+ *     (cksum_hi << 32) | cksum_lo
+ * - Because checksum is stored in the first 8 bytes of any given block, when it
+ *   is calculated we ignore the first uint64_t/first two words.
  */
 
 #include "apfs_vxd.h"
@@ -45,24 +42,46 @@
 #define MOD_VALUE 0xFFFFFFFF
 
 /* ========================================================================== */
+/* Static Helpers                                                             */
+/* ========================================================================== */
+
+/*
+ * This function is takes two values, adding them and then modulo-ing
+ * them with 0xFFFFFFFF without using __aullrem. The idea is that when
+ * there is an overflow we add one the the jumps off the end of the 
+ * value which gives us (a + b) % 0xFFFFFFFF.
+ */
+static uint32_t addmod(uint32_t a, uint32_t b) {
+	uint32_t c = a + b;
+	if(c < a) c++;	/* The integer value has overflown so add 1 back */
+
+	/*
+	 * This is for the case where result is exactly the number we 
+	 * we want to modulo the sum by so we just return 0 here.
+	 */
+	if(c == 0xFFFFFFFF) return 0; 
+	return c;
+}
+
+/* ========================================================================== */
 /* Public API                                                                 */
 /* ========================================================================== */
 
 /*
  * apfs_fletcher64 -- Compute Fletcher-64 checksum over a buffer.
  *
- * The buffer is treated as an array of 32-bit words. Two 64-bit
+ * The buffer is treated as an array of 32-bit words. Two 32-bit
  * accumulators are maintained and folded modulo 0xFFFFFFFF. The
  * result is constructed so that storing it in the first 8 bytes
  * of the block makes the overall checksum zero.
  */
-uint64_t apfs_fletcher64(const void* buf, uint32_t len) {
+uint64_t apfs_fletcher64(const void* buf, uint32_t len, uint32_t first) {
 	const uint32_t* data;
 	uint32_t nwords;
-	uint64_t sum1;
-	uint64_t sum2;
-	uint64_t cksum_lo;
-	uint64_t cksum_hi;
+	uint32_t sum1;
+	uint32_t sum2;
+	uint32_t cksum_lo;
+	uint32_t cksum_hi;
 	uint32_t i;
 
 	data = (const uint32_t*)buf;
@@ -70,22 +89,22 @@ uint64_t apfs_fletcher64(const void* buf, uint32_t len) {
 	sum1 = 0;
 	sum2 = 0;
 
-	for (i = 0; i < nwords; i++) {
-		sum1 = (sum1 + data[i]) % MOD_VALUE;
-		sum2 = (sum2 + sum1) % MOD_VALUE;
+	for (i = first; i < nwords; i++) {
+		sum1 = addmod(sum1, data[i]);
+		sum2 = addmod(sum2, sum1);
 	}
 
-	cksum_lo = MOD_VALUE - ((sum1 + sum2) % MOD_VALUE);
-	cksum_hi = MOD_VALUE - ((sum1 + cksum_lo) % MOD_VALUE);
-	return (cksum_hi << 32) | cksum_lo;
+	cksum_lo = MOD_VALUE - addmod(sum1, sum2);
+	cksum_hi = MOD_VALUE - addmod(sum1, cksum_lo);
+	return (((uint64_t)cksum_hi) << 32) | cksum_lo;
 }
 
 /*
  * apfs_verify_block -- Verify Fletcher-64 checksum of an APFS object block.
  *
  * The checksum is stored in the first 8 bytes of the block (the o_cksum
- * field of obj_phys_t). We copy the block, zero the checksum field,
- * recompute, and compare against the stored value.
+ * field of obj_phys_t). We copy the checksum, recompute, and compare against
+ * the stored value.
  *
  * Returns 0 on success, -1 on checksum mismatch or error.
  */
@@ -104,21 +123,8 @@ int apfs_verify_block(const void* block_buf, uint32_t block_size) {
 	 * entire block (with the checksum field zeroed) produces the stored value.
 	 * So: zero out the checksum field, compute, compare.
 	 */
-	copy = (uint8_t*)_HeapAllocate(block_size, 0);
-	if (!copy) {
-		return -1;
-	}
-
-	memcpy(copy, block_buf, block_size);
-
-	/* Save the stored checksum, then zero the field */
-	memcpy(&stored, copy, sizeof(stored));
-	memset(copy, 0, 8);
-
-	/* Compute over the entire block with checksum field zeroed */
-	computed = apfs_fletcher64(copy, block_size);
-	_HeapFree(copy, 0);
-
+	memcpy(&stored, block_buf, sizeof(stored));
+	computed = apfs_fletcher64(block_buf, block_size, 2); /* Jump over the current checksum */
 	if (computed != stored) {
 		/* Don't log errors for all-zero blocks (empty ring buffer slots) */
 		if (stored == 0) {

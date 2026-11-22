@@ -339,9 +339,10 @@ typedef int (*btree_visitor_fn)(const void* key, uint16_t key_len,
  * apfs_fletcher64 -- Compute Fletcher-64 checksum over a buffer.
  * buf:        Pointer to data (treated as array of uint32_t)
  * len:        Length in bytes (must be multiple of 4)
+ * first:	   Index to start checksum within the buffer
  * Returns:    64-bit Fletcher-64 checksum value
  */
-uint64_t apfs_fletcher64(const void* buf, uint32_t len);
+uint64_t apfs_fletcher64(const void* buf, uint32_t len, uint32_t first);
 
 /*
  * apfs_verify_block -- Verify Fletcher-64 checksum of an APFS object block.
